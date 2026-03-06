@@ -5,3 +5,9 @@ __pycache__/
 *.pyc
 *.log
 *.db
+
+# Arquivos de lock de editores (LibreOffice, etc.)
+.~lock.*
+
+# Arquivos baixados pelo pipeline
+dags/downloads/

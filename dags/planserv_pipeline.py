@@ -1,16 +1,19 @@
 from airflow import DAG
 from airflow.operators.python import PythonOperator, BranchPythonOperator
 from airflow.operators.empty import EmptyOperator
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import requests
 import os
 import pandas as pd
 import re
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 
 API_URL = "https://pv-strapi-api-live.maida.health/api/tabelas?sort[1]=ordem:asc&populate=*"
 BASE_URL = "https://pv-strapi-api-live.maida.health"
 STATE_PATH = "/opt/airflow/state/state.json"
+SLACK_CHANNEL = os.environ.get("SLACK_CHANNEL", "C0AGNL16ZS4")
 
 
 BASE_DOWNLOAD_DIR = "/opt/airflow/dags/downloads"
@@ -22,7 +25,7 @@ GOLD_DIR = os.path.join(BASE_DOWNLOAD_DIR, "gold")
 
 def extrair_metadata_planserv(**context):
 
-    response = requests.get(API_URL)
+    response = requests.get(API_URL, timeout=30)
     response.raise_for_status()
 
     json_data = response.json()
@@ -102,11 +105,12 @@ def baixar_arquivos(**context):
 
         print(f"Baixando {nome}...")
 
-        r = requests.get(url)
+        r = requests.get(url, stream=True, timeout=60)
         r.raise_for_status()
 
         with open(caminho, "wb") as f:
-            f.write(r.content)
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
 
         arquivos_baixados.append({
             "tipo": tipo,
@@ -189,6 +193,7 @@ def processar_tipo_silver(context, tipo_alvo):
     
 def silver_materiais(df, caminho_saida):
 
+    # A planilha de materiais possui 1 linha de cabeçalho antes dos dados reais
     df = df.iloc[1:]
     df = df.replace(r'^\s*$', '', regex=True)
     df = df.dropna(how="all")
@@ -218,7 +223,7 @@ def silver_materiais(df, caminho_saida):
     
 def silver_medicamentos(df, caminho_saida):
 
-
+    # A planilha de medicamentos possui 4 linhas de cabeçalho antes dos dados reais
     df = df.iloc[4:]
     df = df.replace(r'^\s*$', '', regex=True)
     df = df.dropna(how="all")
@@ -422,7 +427,6 @@ def verificar_se_novo(**context):
 
     novos_arquivos = []
 
-    from datetime import datetime
 
     for item in arquivos:
 
@@ -456,9 +460,6 @@ def verificar_se_novo(**context):
 
 
 
-from slack_sdk import WebClient
-from slack_sdk.errors import SlackApiError
-
 def enviar_gold_para_slack(**context):
 
     slack_token = os.environ.get("SLACK_BOT_TOKEN")
@@ -490,7 +491,7 @@ def enviar_gold_para_slack(**context):
 
         try:
             client.files_upload_v2(
-                channel="C0AGNL16ZS4",
+                channel=SLACK_CHANNEL,
                 file=caminho_gold,
                 title=f"Gold - {tipo}",
                 initial_comment=f"Arquivo atualizado: {nome_arquivo}"
@@ -536,9 +537,10 @@ def atualizar_estado(**context):
     for item in novos:
         estado["planserv"][item["nome"]] = {
             "updatedAt": item["updatedAt"],
-            "processed_at": datetime.utcnow().isoformat()
+            "processed_at": datetime.now(timezone.utc).isoformat()
         }
 
+    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
     with open(STATE_PATH, "w") as f:
         json.dump(estado, f, indent=4)
 
@@ -567,7 +569,8 @@ with DAG(
 
     download = PythonOperator(
         task_id="download_files",
-        python_callable=baixar_arquivos
+        python_callable=baixar_arquivos,
+        trigger_rule="none_failed_min_one_success"
     )
 
     silver = PythonOperator(

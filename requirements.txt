@@ -1,0 +1,6 @@
+requests
+pandas
+openpyxl
+slack_sdk
+beautifulsoup4
+lxml
